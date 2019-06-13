@@ -317,8 +317,8 @@ def build_targets(model, targets):
 
     nt = len(targets)
     txy, twh, tcls, tbox, indices, anchor_vec = [], [], [], [], [], []
-    for i in model.yolo_layers:
-        layer = model.module_list[i][0]
+    for i in range(len(model.yolo_layers)):
+        layer = model.yolo_layers[i]
 
         # iou of targets-anchors
         t, a = targets, []

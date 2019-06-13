@@ -1,15 +1,17 @@
 import argparse
 import time
 
+import torch
 import torch.distributed as dist
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader
 
-#import test  # Import test.py to get mAP after each epoch
+import test  # Import test.py to get mAP after each epoch
 from models import *
 from utils.datasets import *
 from utils.utils import *
+from utils.parse_config import *
 
 # Hyperparameters: train.py --evolve --epochs 2 --img-size 320, Metrics: 0.204      0.302      0.175      0.234 (square smart)
 hyp = {'xy': 0.1,  # xy loss gain  (giou is about 0.02)
@@ -63,29 +65,23 @@ def train(
     nf = 33  # yolo layer size (i.e. 255)
 
     #########################################################
-    # if resume:  # Load previously saved model
-    #     if transfer:  # Transfer learning
-    #         chkpt = torch.load(weights + 'yolov3-spp.pt', map_location=device)
-    #         model.load_state_dict({k: v for k, v in chkpt['model'].items() if v.numel() > 1 and v.shape[0] != 255},
-    #                               strict=False)
-    #         for p in model.parameters():
-    #             p.requires_grad = True if p.shape[0] == nf else False
+    if resume:  # Load previously saved model
+        if transfer:  # Transfer learning
+            chkpt = torch.load(weights + 'yolov3-spp.pt', map_location=device)
+            model.load_state_dict({k: v for k, v in chkpt['model'].items() if v.numel() > 1 and v.shape[0] != 255},
+                                  strict=False)
+            for p in model.parameters():
+                p.requires_grad = True if p.shape[0] == nf else False
 
-    #     else:  # resume from latest.pt
-    #         chkpt = torch.load(latest, map_location=device)  # load checkpoint
-    #         model.load_state_dict(chkpt['model'])
+        else:  # resume from latest.pt
+            chkpt = torch.load(latest, map_location=device)  # load checkpoint
+            model.load_state_dict(chkpt['model'])
 
-    #     start_epoch = chkpt['epoch'] + 1
-    #     if chkpt['optimizer'] is not None:
-    #         optimizer.load_state_dict(chkpt['optimizer'])
-    #         best_loss = chkpt['best_loss']
-    #     del chkpt
-
-    # else:  # Initialize model with backbone (optional)
-    #     if '-tiny.cfg' in cfg:
-    #         cutoff = load_darknet_weights(model, weights + 'yolov3-tiny.conv.15')
-    #     else:
-    #         cutoff = load_darknet_weights(model, weights + 'darknet53.conv.74')
+        start_epoch = chkpt['epoch'] + 1
+        if chkpt['optimizer'] is not None:
+            optimizer.load_state_dict(chkpt['optimizer'])
+            best_loss = chkpt['best_loss']
+        del chkpt
     #########################################################################################
 
 
@@ -193,11 +189,7 @@ def train(
                 return results
 
             # Compute gradient
-            if mixed_precision:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            loss.backward()
 
             # Accumulate gradient for x batches before optimizing
             if (i + 1) % accumulate == 0 or (i + 1) == nb:

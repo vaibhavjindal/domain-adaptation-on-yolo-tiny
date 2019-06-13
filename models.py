@@ -1,3 +1,4 @@
+import torch
 from torch import nn
 import torch.nn.functional as F
 
@@ -47,7 +48,7 @@ class YOLOLayer(nn.Module):
                 io[..., 5] = 1  # single-class model https://github.com/ultralytics/yolov3/issues/235
 
             # reshape from [1, 3, 13, 13, 85] to [1, 507, 85]
-return io.view(bs, -1, 5 + self.nc), p
+            return io.view(bs, -1, 5 + self.nc), p
 
 
 def create_grids(self, img_size=416, ng=(13, 13), device='cpu'):
@@ -137,6 +138,8 @@ class Net(nn.Module):
         self.conv23 = nn.Conv2d(256, 33, 1,stride=1,padding=0)
 
         self.yolo24_2 = YOLOLayer([(10,14),(23,27),(37,58)],6,608)
+
+        self.yolo_layers = [self.yolo17_1, self.yolo24_2]
 
     def forward(self, x):
         img_size = max(x.shape[-2:])
