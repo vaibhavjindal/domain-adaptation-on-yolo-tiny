@@ -79,6 +79,29 @@ class Upsample(nn.Module):
         x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
         return x
 
+
+class Dnet(nn.Module):
+	def __init__(self):
+		super().__init__()
+		self.conv1 = nn.conv2d(128,64,4,stride=2,padding=1)
+		self.bn1 = nn.BatchNorm2d(64)
+		self.fc1 = nn.Linear(19*19*64,1024)
+		self.fc2 = nn.Linear(1024,1024)
+		self.fc3 = nn.Linear(1024,1)
+
+	def forward(self,x,lmbda):
+		x = GRL.apply(x,lmbda) 
+		x = self.bn1(self.conv1(x))
+		x = F.leaky_relu(x,0.1,True)
+		x = x.view(-1, 19*19*64)
+		x = F.leaky_relu(self.fc1(x),0.1,True)
+		x = F.leaky_relu(self.fc2(x),0.1,True)
+		x = self.fc3(x)
+
+		return x
+
+
+
 class Net(nn.Module):
     def __init__(self):
         super().__init__()
@@ -210,7 +233,7 @@ class Net(nn.Module):
         output.append(out2)
 
         if self.training:
-            return output
+            return output,x2
         else:
             io, p = list(zip(*output))  # inference output, training output
             return torch.cat(io, 1), p
