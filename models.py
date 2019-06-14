@@ -83,7 +83,7 @@ class Upsample(nn.Module):
 class Dnet(nn.Module):
 	def __init__(self):
 		super().__init__()
-		self.conv1 = nn.conv2d(128,64,4,stride=2,padding=1)
+		self.conv1 = nn.Conv2d(128,64,4,stride=2,padding=1)
 		self.bn1 = nn.BatchNorm2d(64)
 		self.fc1 = nn.Linear(19*19*64,1024)
 		self.fc2 = nn.Linear(1024,1024)

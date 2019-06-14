@@ -4,3 +4,4 @@ valid=./data/sdd_test.txt
 names=./data/sdd.names
 backup=backup/
 eval=sdd
+target_train=./data/sdd_target_train.txt

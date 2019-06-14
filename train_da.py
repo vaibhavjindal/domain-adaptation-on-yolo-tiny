@@ -24,12 +24,6 @@ hyp = {'xy': 0.1,  # xy loss gain  (giou is about 0.02)
        'momentum': 0.90,  # SGD momentum
        'weight_decay': 0.0005}  # optimizer weight decay
 
-hyp_dis = {'lr0': 0.001,  # initial learning rate
-       'lrf': -4.,  # final learning rate = lr0 * (10 ** lrf)
-       'momentum': 0.90,  # SGD momentum
-       'weight_decay': 0.0005}  # optimizer weight decay
-
-
 def train(
         cfg,
         data_cfg,
@@ -57,19 +51,13 @@ def train(
     # Configure run
     data_dict = parse_data_cfg(data_cfg)
     train_path = data_dict['train']
-    target_train_path = data_dict['target_train']
     nc = int(data_dict['classes'])  # number of classes
 
     # Initialize model
     model = Net().to(device)
-    dis = Dnet().to(device)
-
-    #Discriminator loss
-    criterion_d = nn.BCEWithLogitsLoss()
 
     # Optimizer
     optimizer = optim.SGD(model.parameters(), lr=hyp['lr0'], momentum=hyp['momentum'], weight_decay=hyp['weight_decay'])
-    optimizer_dis = optim.SGD(dis.parameters(), lr=hyp_dis['lr0'], momentum=hyp_dis['momentum'], weight_decay=hyp_dis['weight_decay'])
 
     cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
@@ -78,16 +66,21 @@ def train(
 
     #########################################################
     if resume:  # Load previously saved model
-        chkpt = torch.load(latest, map_location=device)  # load checkpoint
-        model.load_state_dict(chkpt['model'])
-        dis.load_state_dict(chkpt['dis'])
+        if transfer:  # Transfer learning
+            chkpt = torch.load(weights + 'yolov3-spp.pt', map_location=device)
+            model.load_state_dict({k: v for k, v in chkpt['model'].items() if v.numel() > 1 and v.shape[0] != 255},
+                                  strict=False)
+            for p in model.parameters():
+                p.requires_grad = True if p.shape[0] == nf else False
+
+        else:  # resume from latest.pt
+            chkpt = torch.load(latest, map_location=device)  # load checkpoint
+            model.load_state_dict(chkpt['model'])
 
         start_epoch = chkpt['epoch'] + 1
         if chkpt['optimizer'] is not None:
             optimizer.load_state_dict(chkpt['optimizer'])
             best_loss = chkpt['best_loss']
-        if chkpt['optimizer_dis'] is not None:
-            optimizer_dis.load_state_dict(chkpt['optimizer_dis'])
         del chkpt
     #########################################################################################
 
@@ -99,9 +92,6 @@ def train(
     # scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[round(opt.epochs * x) for x in (0.8, 0.9)], gamma=0.1)
     scheduler.last_epoch = start_epoch - 1
-
-    scheduler_dis = lr_scheduler.MultiStepLR(optimizer_dis, milestones=[round(opt.epochs * x) for x in (0.8, 0.9)], gamma=0.1)
-    scheduler_dis.last_epoch = start_epoch - 1
 
     # # Plot lr schedule
     # y = []
@@ -121,16 +111,10 @@ def train(
                                   augment=True,
                                   rect=False)
 
-    dataset_target = LoadTargetImages(target_train_path,
-                                  img_size,
-                                  batch_size,
-                                  augment=True)
-
     # Initialize distributed training
     if torch.cuda.device_count() > 1:
         dist.init_process_group(backend=opt.backend, init_method=opt.dist_url, world_size=opt.world_size, rank=opt.rank)
         model = torch.nn.parallel.DistributedDataParallel(model)
-        dis = torch.nn.parallel.DistributedDataParallel(dis)
         # sampler = torch.utils.data.distributed.DistributedSampler(dataset)
 
     # Dataloader
@@ -141,35 +125,22 @@ def train(
                             pin_memory=True,
                             collate_fn=dataset.collate_fn)
 
-    dataloader_target = DataLoader(dataset_target,
-                            batch_size=batch_size,
-                            num_workers=opt.num_workers,
-                            shuffle=True,  # disable rectangular training if True
-                            pin_memory=True,
-                            collate_fn=dataset_target.collate_fn)
-
-
     # Remove old results
     for f in glob.glob('*_batch*.jpg') + glob.glob('results.txt'):
         os.remove(f)
 
     # Start training
     model.hyp = hyp  # attach hyperparameters to model
-    dis.hyp = hyp_dis
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device)  # attach class weights
     model_info(model)
-    model_info(dis)
     nb = len(dataloader)
-    nbt = len(dataloader_target)
-    count_batches = min(nb,nbt)
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0)  # P, R, mAP, F1, test_loss
-    n_burnin = min(round(count_batches / 5 + 1), 1000)  # burn-in batches
+    n_burnin = min(round(nb / 5 + 1), 1000)  # burn-in batches
     t, t0 = time.time(), time.time()
     for epoch in range(start_epoch, epochs):
         model.train()
-        dis.train()
-        print(('\n%8s%12s' + '%10s' * 8) % ('Epoch', 'Batch', 'xy', 'wh', 'conf', 'cls', 'total', 'dis_loss' , 'targets', 'time'))
+        print(('\n%8s%12s' + '%10s' * 7) % ('Epoch', 'Batch', 'xy', 'wh', 'conf', 'cls', 'total', 'targets', 'time'))
 
         # Update scheduler
         scheduler.step()
@@ -184,32 +155,32 @@ def train(
         # w = model.class_weights.cpu().numpy() * (1 - maps)  # class weights
         # image_weights = labels_to_image_weights(dataset.labels, nc=nc, class_weights=w)
         # dataset.indices = random.choices(range(dataset.n), weights=image_weights, k=dataset.n)  # random weighted index
-        
-        dataiter = iter(dataloader)
-        dataiter_target = iter(dataloader_target)
 
-        mloss = torch.zeros(6).to(device)  # mean losses
-        
-        lmbda = (2/(1+np.exp(-10*((epoch+0.0)/epochs))))-1
-        for i in range(count_batches):
-            total_loss = 0
-            loss = 0
-            loss_dis = 0
-
-            imgs,targets,_,_ = dataiter.next()
+        mloss = torch.zeros(5).to(device)  # mean losses
+        for i, (imgs, targets, _, _) in enumerate(dataloader):
             imgs = imgs.to(device)
             targets = targets.to(device)
+
+            # Multi-Scale training
+            if opt.multi_scale:
+                if (i + 1 + nb * epoch) % 10 == 0:  #  adjust (67% - 150%) every 10 batches
+                    img_size = random.choice(range(img_size_min, img_size_max + 1)) * 32
+                    print('img_size = %g' % img_size)
+                scale_factor = img_size / max(imgs.shape[-2:])
+                imgs = F.interpolate(imgs, scale_factor=scale_factor, mode='bilinear', align_corners=False)
+
+            # Plot images with bounding boxes
+            if epoch == 0 and i == 0:
+                plot_images(imgs=imgs, targets=targets, fname='train_batch%g.jpg' % i)
 
             # SGD burn-in
             if epoch == 0 and i <= n_burnin:
                 lr = hyp['lr0'] * (i / n_burnin) ** 4
                 for x in optimizer.param_groups:
                     x['lr'] = lr
-                for x in optimizer_dis.param_groups:
-                    x['lr'] = lr
 
             # Run model
-            pred,dis_input = model(imgs)
+            pred = model(imgs)
 
             # Compute loss
             loss, loss_items = compute_loss(pred, targets, model)
@@ -217,36 +188,17 @@ def train(
                 print('WARNING: nan loss detected, ending training')
                 return results
 
-            dis_out_source = dis(dis_input,lmbda)
-            actual_d = torch.zeros(dis_out_source.shape)
-            actual_d = actual_d.to(device)
-            loss_d = criterion_d(dis_out_source,actual_d)
-            loss_dis += loss_d 
-
-            #target domain
-            imgs_t,_,_ = dataiter_target.next()
-            imgs_t = imgs_t.to(device)
-            _,dis_input_t = model(imgs_t)
-            dis_out_target = dis(dis_input_t,lmbda)
-            actual_d_t = torch.ones(dis_out_target.shape)
-            actual_d_t = actual_d_t.to(device)
-            loss_d_t = criterion_d(dis_out_target,actual_d_t)
-            loss_dis += loss_d_t            
-
-            #Compute grads
-            total_loss = loss + loss_dis
-            total_loss.backward()
+            # Compute gradient
+            loss.backward()
 
             # Accumulate gradient for x batches before optimizing
-            if (i + 1) % accumulate == 0 or (i + 1) == count_batches:
-                optimizer_dis.step()
+            if (i + 1) % accumulate == 0 or (i + 1) == nb:
                 optimizer.step()
                 optimizer.zero_grad()
-                optimizer_dis.zero_grad()
 
-            #Print batch results
-            mloss = (mloss * i + torch.cat((loss_items.to(device),torch.Tensor([loss_dis]).to(device))).to(device)) / (i + 1)  # update mean losses
-            s = ('%8s%12s' + '%10.3g' * 8) % (
+            # Print batch results
+            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+            s = ('%8s%12s' + '%10.3g' * 7) % (
                 '%g/%g' % (epoch, epochs - 1),
                 '%g/%g' % (i, nb - 1), *mloss, len(targets), time.time() - t)
             t = time.time()
@@ -294,8 +246,8 @@ def train(
     dt = (time.time() - t0) / 3600
     print('%g epochs completed in %.3f hours.' % (epoch - start_epoch + 1, dt))
     return results
-            ###make changes here
-        
+
+
 def print_mutation(hyp, results):
     # Write mutation results
     a = '%11s' * len(hyp) % tuple(hyp.keys())  # hyperparam keys

@@ -128,6 +128,91 @@ class LoadWebcam:  # for inference
     def __len__(self):
         return 0
 
+class LoadTargetImages(Dataset):
+    def __init__(self, path, img_size=416, batch_size=16, augment=False):
+        with open(path, 'r') as f:
+            img_files = f.read().splitlines()
+            self.img_files = list(filter(lambda x: len(x) > 0, img_files))   
+            
+        n = len(self.img_files)
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        nb = bi[-1] + 1  # number of batches
+        assert n > 0, 'No images found in %s' % path
+
+        self.n = n
+        self.batch = bi  # batch index of image
+        self.img_size = img_size
+        self.augment = augment     
+
+        self.imgs = [None] * n
+
+    def __len__(self):
+        return len(self.img_files)
+
+    def __getitem__(self, index):
+
+        img_path = self.img_files[index]
+        # Load image
+        img = self.imgs[index]
+        if img is None:
+            img = cv2.imread(img_path)  # BGR
+            assert img is not None, 'File Not Found ' + img_path
+            if self.n < 1001:
+                self.imgs[index] = img  # cache image into memory
+
+        # Augment colorspace
+        augment_hsv = True
+        if self.augment and augment_hsv:
+            # SV augmentation by 50%
+            fraction = 0.50  # must be < 1.0
+            img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  # hue, sat, val
+            S = img_hsv[:, :, 1].astype(np.float32)  # saturation
+            V = img_hsv[:, :, 2].astype(np.float32)  # value
+
+            a = (random.random() * 2 - 1) * fraction + 1
+            b = (random.random() * 2 - 1) * fraction + 1
+            S *= a
+            V *= b
+
+            img_hsv[:, :, 1] = S if a < 1 else S.clip(None, 255)
+            img_hsv[:, :, 2] = V if b < 1 else V.clip(None, 255)
+            cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
+
+        # Letterbox
+        h, w, _ = img.shape
+        shape = self.img_size
+        img, ratio, padw, padh = letterbox(img, new_shape=shape, mode='square')
+
+        # Augment image 
+        if self.augment:
+            img, _ = random_affine(img, None, degrees=(-5, 5), translate=(0.10, 0.10), scale=(0.90, 1.10))
+
+        
+        if self.augment:
+            # random left-right flip
+            lr_flip = True
+            if lr_flip and random.random() > 0.5:
+                img = np.fliplr(img)
+                
+            # random up-down flip
+            ud_flip = False
+            if ud_flip and random.random() > 0.5:
+                img = np.flipud(img)
+                
+        
+        # Normalize
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = np.ascontiguousarray(img, dtype=np.float32)  # uint8 to float32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+
+        return torch.from_numpy(img), img_path, (h, w)
+
+    @staticmethod
+    def collate_fn(batch):
+        img, path, hw = list(zip(*batch))  # transposed
+        return torch.stack(img, 0), path, hw
+
+
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=416, batch_size=16, augment=False, rect=True, image_weights=False):
@@ -434,3 +519,5 @@ def convert_images2bmp():
             '/Users/glennjocher/PycharmProjects/', '../')
         with open(label_path.replace('5k', '5k_bmp'), 'w') as file:
             file.write(lines)
+
+
