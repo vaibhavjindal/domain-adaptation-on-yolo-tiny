@@ -1,0 +1,7 @@
+classes=6
+train=./data/sdd_train.txt
+valid=./data/sdd_test70.txt
+names=./data/sdd.names
+backup=backup/
+eval=sdd
+target_train=./data/sdd_target_train.txt

@@ -19,7 +19,7 @@ hyp = {'xy': 0.1,  # xy loss gain  (giou is about 0.02)
        'cls': 0.04,  # cls loss gain
        'conf': 4.5,  # conf loss gain
        'iou_t': 0.5,  # iou target-anchor training threshold
-       'lr0': 0.001,  # initial learning rate
+       'lr0': 0.0001,  # initial learning rate
        'lrf': -4.,  # final learning rate = lr0 * (10 ** lrf)
        'momentum': 0.90,  # SGD momentum
        'weight_decay': 0.0005}  # optimizer weight decay
@@ -44,6 +44,7 @@ def train(
     init_seeds()
     weights = 'weights' + os.sep
     latest = weights + 'latest.pt'
+    bench = weights + 'bench.pt'
     best = weights + 'best.pt'
     device = torch_utils.select_device()
     torch.backends.cudnn.benchmark = True  # possibly unsuitable for multiscale
@@ -64,18 +65,34 @@ def train(
     model = Net().to(device)
     dis = Dnet().to(device)
 
+    for param in model.conv1.parameters():
+        param.requires_grad = False
+    for param in model.bn1.parameters():
+        param.requires_grad = False
+    for param in model.conv3.parameters():
+        param.requires_grad = False
+    for param in model.bn3.parameters():
+        param.requires_grad = False
+#    for param in model.conv5.parameters():
+#        param.requires_grad = False
+#    for param in model.bn5.parameters():
+#        param.requires_grad = False
+
+    print(model.conv5.weight.requires_grad, model.conv7.weight.requires_grad, model.bn5.weight.requires_grad, model.bn5.running_mean.requires_grad)
+    # Optimizer
+    optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=hyp['lr0'], momentum=hyp['momentum'], weight_decay=hyp['weight_decay'])
+    optimizer_dis = optim.SGD(dis.parameters(), lr=hyp_dis['lr0'], momentum=hyp_dis['momentum'], weight_decay=hyp_dis['weight_decay'])
+
+
+
     #Discriminator loss
     criterion_d = nn.BCEWithLogitsLoss()
-
-    # Optimizer
-    optimizer = optim.SGD(model.parameters(), lr=hyp['lr0'], momentum=hyp['momentum'], weight_decay=hyp['weight_decay'])
-    optimizer_dis = optim.SGD(dis.parameters(), lr=hyp_dis['lr0'], momentum=hyp_dis['momentum'], weight_decay=hyp_dis['weight_decay'])
 
     cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
     best_loss = float('inf')
     nf = 33  # yolo layer size (i.e. 255)
-
+    
     #########################################################
     if resume:  # Load previously saved model
         chkpt = torch.load(latest, map_location=device)  # load checkpoint
@@ -90,6 +107,10 @@ def train(
             optimizer_dis.load_state_dict(chkpt['optimizer_dis'])
         del chkpt
     #########################################################################################
+    else:
+        chkpt = torch.load(bench,map_location=device)
+        model.load_state_dict(chkpt['model'])
+        del chkpt
 
 
     # Scheduler https://github.com/ultralytics/yolov3/issues/238
@@ -150,8 +171,8 @@ def train(
 
 
     # Remove old results
-    for f in glob.glob('*_batch*.jpg') + glob.glob('results.txt'):
-        os.remove(f)
+#    for f in glob.glob('*_batch*.jpg') + glob.glob('results*.txt'):
+#        os.remove(f)
 
     # Start training
     model.hyp = hyp  # attach hyperparameters to model
@@ -190,7 +211,8 @@ def train(
 
         mloss = torch.zeros(6).to(device)  # mean losses
         
-        lmbda = (2/(1+np.exp(-10*((epoch+0.0)/epochs))))-1
+        lmbda = ((2/(1+np.exp(-10*((epoch+0.0)/epochs))))-1)
+#        lmbda = 0
         for i in range(count_batches):
             total_loss = 0
             loss = 0
@@ -203,10 +225,11 @@ def train(
             # SGD burn-in
             if epoch == 0 and i <= n_burnin:
                 lr = hyp['lr0'] * (i / n_burnin) ** 4
+                lr_dis = hyp_dis['lr0'] * (i / n_burnin) ** 4
                 for x in optimizer.param_groups:
                     x['lr'] = lr
                 for x in optimizer_dis.param_groups:
-                    x['lr'] = lr
+                    x['lr'] = lr_dis
 
             # Run model
             pred,dis_input = model(imgs)
@@ -234,7 +257,7 @@ def train(
             loss_dis += loss_d_t            
 
             #Compute grads
-            total_loss = loss + loss_dis
+            total_loss = loss + 2*loss_dis
             total_loss.backward()
 
             # Accumulate gradient for x batches before optimizing
@@ -258,9 +281,19 @@ def train(
                 results, maps = test.test(cfg, data_cfg, batch_size=batch_size, img_size=img_size_test, model=model,
                                           conf_thres=0.1)
 
+        # Calculate mAP (always test final epoch, skip first 5 if opt.nosave)
+        if not (opt.notest or (opt.nosave and epoch < 10)) or epoch == epochs - 1:
+            with torch.no_grad():
+                results_70, maps_70 = test.test(cfg, './data/sdd70.data', batch_size=batch_size, img_size=img_size_test, model=model,
+                                          conf_thres=0.1)
+
+
         # Write epoch results
         with open('results.txt', 'a') as file:
             file.write(s + '%11.3g' * 5 % results + '\n')  # P, R, mAP, F1, test_loss
+
+        with open('results70.txt', 'a') as file:
+            file.write(s + '%11.3g' * 5 % results_70 + '\n')  # P, R, mAP, F1, test_loss
 
         # Update best loss
         test_loss = results[4]
@@ -275,6 +308,8 @@ def train(
                      'best_loss': best_loss,
                      'model': model.module.state_dict() if type(
                          model) is nn.parallel.DistributedDataParallel else model.state_dict(),
+                     'dis': dis.state_dict(),
+                     'optimizer_dis':optimizer_dis.state_dict(),
                      'optimizer': optimizer.state_dict()}
 
             # Save latest checkpoint
